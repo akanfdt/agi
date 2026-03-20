@@ -35,6 +35,18 @@ class GravityField:
 
     def reinforce_pair(self, src: str, dst: str, amount: float | None = None) -> None:
         delta = self.spec.gravity_reinforce_amount if amount is None else amount
+        # 짧은 조각 토큰끼리의 gravity 과강화 방지.
+        # 두 토큰 모두 짧을수록 delta를 약하게 줌.
+        # 최소 gravity_short_token_min_weight까지만 줄어듦.
+        src_clean = src.lstrip("▁")
+        dst_clean = dst.lstrip("▁")
+        src_weight = min(1.0, max(0.4, len(src_clean) / 4.0))
+        dst_weight = min(1.0, max(0.4, len(dst_clean) / 4.0))
+        length_weight = max(
+            self.spec.gravity_short_token_min_weight,
+            src_weight * dst_weight,
+        )
+        delta = delta * length_weight
         _nested_add(self.base_gravity, src, dst, delta)
         _nested_add(self.base_gravity, dst, src, delta * self.spec.gravity_reverse_ratio)
         _nested_add(self.forward_gravity, src, dst, delta)
@@ -69,6 +81,24 @@ class GravityField:
         avg_strength = total / count
         edge_scale = math.log1p(count) / math.log1p(self.spec.gravity_context_top_k)
         return float(min(1.0, avg_strength * edge_scale))
+
+    def decay_all(self) -> None:
+        """
+        전체 gravity를 주기적으로 감쇠.
+        step_update_batch에서 배치당 1회 호출.
+        spec.gravity_base_decay / gravity_forward_decay 사용.
+        """
+        base_decay = float(self.spec.gravity_base_decay)
+        fwd_decay = float(self.spec.gravity_forward_decay)
+        for table, decay in ((self.base_gravity, base_decay), (self.forward_gravity, fwd_decay)):
+            for src in list(table.keys()):
+                edges = table[src]
+                for dst in list(edges.keys()):
+                    edges[dst] *= decay
+                    if edges[dst] < 1e-5:
+                        del edges[dst]
+                if not edges:
+                    del table[src]
 
     def supernova_decay(self, token: str, preserve_tokens: List[str], strength: float) -> None:
         preserve_set = set(preserve_tokens)

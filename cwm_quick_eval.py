@@ -18,15 +18,29 @@ PROMPTS = [
 ]
 
 
-def _sample_token(tokens: List[str], scores: torch.Tensor) -> str | None:
+def _sample_token(
+    tokens: List[str],
+    scores: torch.Tensor,
+    temperature: float,
+    recent: List[str],
+    repeat_penalty: float,
+    repeat_window: int,
+) -> str | None:
     if scores.numel() == 0:
         return None
-    probs = torch.softmax(scores, dim=0)
+    # 반복 패널티: 최근 생성 토큰이면 score 차감
+    scores = scores.clone()
+    recent_set = recent[-repeat_window:]
+    for i, tok in enumerate(tokens):
+        if tok in recent_set:
+            scores[i] -= repeat_penalty
+    probs = torch.softmax(scores / max(temperature, 1e-4), dim=0)
     idx = int(torch.multinomial(probs, 1).item())
     return tokens[idx]
 
 
 def quick_eval(core: CWMCore, bpe: BPETokenizer, max_gen: int = 12) -> None:
+    spec = core.spec
     print("== quick_eval ==")
     for prompt in PROMPTS:
         tokens = bpe.encode(prompt)
@@ -40,7 +54,14 @@ def quick_eval(core: CWMCore, bpe: BPETokenizer, max_gen: int = 12) -> None:
             if scored is None:
                 break
             cand_tokens, scores = scored
-            next_tok = _sample_token(cand_tokens, scores)
+            next_tok = _sample_token(
+                cand_tokens,
+                scores,
+                temperature=spec.gen_temperature,
+                recent=generated,
+                repeat_penalty=spec.gen_repeat_penalty,
+                repeat_window=spec.gen_repeat_window,
+            )
             if next_tok is None:
                 break
             generated.append(next_tok)

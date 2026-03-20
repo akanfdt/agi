@@ -175,7 +175,6 @@ class CWMCore:
     def advance_context(self, tokens: List[str]) -> None:
         for tok in tokens:
             self._ensure_anchor_exists(tok)
-            self.step += 1
             self.context.advance_token(tok, self.step)
 
     def _qa_key(self, tokens: List[str]) -> Optional[Tuple[str, ...]]:
@@ -203,27 +202,67 @@ class CWMCore:
         self.compressed_line_memory = []
 
     def sentence_summary_vector(self, tokens: List[str]) -> Optional[torch.Tensor]:
+        """
+        문장의 느낌 벡터 F를 만든다.
+
+        핵심 아이디어:
+          - 문장 평균 벡터(배경)에서 가장 멀리 떨어진 토큰이
+            이 문장의 핵심 느낌을 담고 있다.
+          - deviation(평균과의 거리)을 softmax로 변환해서 가중치로 사용.
+          - "나 오늘 너무 슬프다"에서 "슬프다"가 평균에서 가장 다르면
+            F가 "슬프다" 방향을 강하게 반영한다.
+          - 자주 나오는 조각 토큰("나", "오늘")은 평균 근처에 있으므로
+            자동으로 낮은 가중치를 받는다.
+        """
         if not tokens:
             return None
-        weighted: List[torch.Tensor] = []
-        weights: List[float] = []
-        total = len(tokens)
-        for idx, tok in enumerate(tokens):
+
+        vecs: List[torch.Tensor] = []
+        valid_tokens: List[str] = []
+        for tok in tokens:
             self._ensure_anchor_exists(tok)
             anchor = self.points.anchors.get(tok)
             if anchor is None:
                 continue
-            # Sentence understanding should lean slightly toward later tokens
-            # while still preserving the whole utterance.
-            recency = self.spec.sentence_recency_base + self.spec.sentence_recency_range * ((idx + 1) / max(1, total))
-            importance = 1.0 + min(1.0, float(anchor.importance) * 0.05)
-            weight = recency * importance
-            weighted.append(anchor.vec.to(self.device) * weight)
-            weights.append(weight)
-        if not weighted:
+            vecs.append(anchor.vec.to(self.device))
+            valid_tokens.append(tok)
+
+        if not vecs:
             return None
-        summary = torch.stack(weighted, dim=0).sum(dim=0) / max(sum(weights), 1e-8)
-        return l2_normalize(summary)
+
+        # 토큰이 1개면 그냥 반환
+        if len(vecs) == 1:
+            return l2_normalize(vecs[0])
+
+        vec_stack = torch.stack(vecs, dim=0)  # [N, dim]
+
+        # 1단계: 단순 평균 (배경 벡터)
+        mean_vec = vec_stack.mean(dim=0)  # [dim]
+        mean_norm = float(mean_vec.norm().item())
+        # mean_vec norm이 0에 가까우면 토큰들이 서로 상쇄 → 균등 가중치로 폴백
+        if mean_norm < 1e-6:
+            F = vec_stack.mean(dim=0)
+            return l2_normalize(F)
+        mean_vec = mean_vec / (mean_norm + 1e-8)
+
+        # 2단계: 각 토큰이 평균에서 얼마나 다른가 (코사인 거리)
+        sims_to_mean = torch.mv(vec_stack, mean_vec)  # [N]
+        sims_to_mean = sims_to_mean.clamp(-1.0, 1.0)  # 수치 안정성
+        deviations = 1.0 - sims_to_mean  # 클수록 배경과 다름 = 핵심 토큰
+
+        # 3단계: deviation을 softmax로 가중치 변환
+        # feeling_temperature가 높을수록 핵심 토큰에 집중
+        temp = max(1e-4, self.spec.feeling_temperature)
+        weights = torch.softmax(deviations * temp, dim=0)  # [N]
+
+        # 최소 가중치 보장 (배경 토큰도 완전히 무시하지 않음)
+        min_w = self.spec.feeling_min_weight / max(1, len(vecs))
+        weights = weights.clamp(min=min_w)
+        weights = weights / weights.sum()
+
+        # 4단계: 가중합으로 느낌 벡터 F 구성
+        F = (vec_stack * weights.unsqueeze(-1)).sum(dim=0)
+        return l2_normalize(F)
 
     def _line_vector(self, tokens: List[str]) -> Optional[torch.Tensor]:
         return self.sentence_summary_vector(tokens)
@@ -299,20 +338,67 @@ class CWMCore:
         return self.summary_prior()
 
     def observe_sentence(self, tokens: List[str]) -> None:
-        line_vec = self.sentence_summary_vector(tokens)
-        if line_vec is None:
+        """
+        문장 전체를 느낌 벡터 F로 압축하고,
+        F 방향으로 문장 내 토큰들을 당긴다.
+
+        핵심 변화:
+          - 이전: summary_memory(과거 기억)로 토큰을 당김
+          - 지금: 이 문장 자체의 느낌 F로 토큰을 당김
+          - 효과: "슬프다"가 포함된 문장들이 공간에서 같은 방향으로 모임
+          - deviation 가중치를 재활용해서 핵심 토큰은 강하게,
+            배경 토큰은 약하게 당김
+        """
+        if not tokens:
             return
-        summary_vec = self.summary_memory_vector()
-        if summary_vec is not None:
-            alpha = self.alpha() * self.spec.line_summary_strength
-            for tok in tokens:
-                self._ensure_anchor_exists(tok)
-                self.points.update_vector(tok, summary_vec, alpha, self.step)
-                self.points.anchors[tok].importance += self.spec.line_summary_strength * self.spec.importance_observe
-            self._mark_cache_dirty()
+
+        # 느낌 벡터 F 계산 (deviation 기반)
+        vecs: List[torch.Tensor] = []
+        valid_tokens: List[str] = []
+        for tok in tokens:
+            self._ensure_anchor_exists(tok)
+            anchor = self.points.anchors.get(tok)
+            if anchor is None:
+                continue
+            vecs.append(anchor.vec.to(self.device))
+            valid_tokens.append(tok)
+
+        if not vecs:
+            return
+
+        vec_stack = torch.stack(vecs, dim=0)
+
+        if len(vecs) == 1:
+            F = l2_normalize(vecs[0])
+            token_weights = torch.ones(1, device=self.device)
+        else:
+            mean_vec = l2_normalize(vec_stack.mean(dim=0))
+            sims_to_mean = torch.mv(vec_stack, mean_vec)
+            deviations = 1.0 - sims_to_mean
+            temp = max(1e-4, self.spec.feeling_temperature)
+            token_weights = torch.softmax(deviations * temp, dim=0)
+            min_w = self.spec.feeling_min_weight / max(1, len(vecs))
+            token_weights = token_weights.clamp(min=min_w)
+            token_weights = token_weights / token_weights.sum()
+            F = l2_normalize((vec_stack * token_weights.unsqueeze(-1)).sum(dim=0))
+
+        # F 방향으로 각 토큰을 당김
+        # 핵심 토큰(deviation 큰 것)은 강하게, 배경 토큰은 약하게
+        base_alpha = self.alpha() * self.spec.line_summary_strength * self.spec.feeling_attract_scale
+        for i, tok in enumerate(valid_tokens):
+            w = float(token_weights[i].item())
+            attract_alpha = base_alpha * w * len(valid_tokens)  # 토큰 수 보정
+            self.points.update_vector(tok, F, attract_alpha, self.step)
+            self._add_importance(
+                tok,
+                self.spec.line_summary_strength * self.spec.importance_observe * w,
+            )
+        self._mark_cache_dirty()
+
+        # F를 memory에 등록
         self.raw_line_memory.append(
             {
-                "vec": line_vec.detach().to(self.device),
+                "vec": F.detach().to(self.device),
                 "span": 1,
                 "depth": 0,
                 "last_step": self.step,
@@ -324,16 +410,48 @@ class CWMCore:
         self.observe_sentence(tokens)
 
     def reinforce_dialogue(self, question_tokens: List[str], answer_tokens: List[str]) -> None:
-        q_vec = self.token_vector(question_tokens)
-        if q_vec is None:
+        """
+        질문 문장의 느낌 F_q → 답변 문장의 느낌 F_a 흐름을 학습.
+
+        핵심 변화:
+          - 이전: 질문 토큰 평균 벡터로 답변 토큰을 당김 (토큰 단위)
+          - 지금: 질문 느낌 F_q → 답변 느낌 F_a 방향으로
+                  답변 토큰들을 당기고 gravity도 느낌 단위로 기록
+          - 효과: "나 슬퍼(F_q) → 왜?(F_a)" 패턴이
+                  토큰이 아니라 느낌 공간에 새겨짐
+        """
+        # 질문과 답변의 느낌 벡터 계산
+        F_q = self.sentence_summary_vector(question_tokens)
+        F_a = self.sentence_summary_vector(answer_tokens)
+        if F_q is None or F_a is None:
             return
+
         alpha = self.alpha() * self.spec.dialogue_strength
+
+        # 답변 토큰들을 F_q 방향이 아니라 F_a 방향으로 당김
+        # (답변의 느낌을 강화 — 답변이 자기 느낌을 더 선명하게 가지도록)
         for tok in answer_tokens:
             self._ensure_anchor_exists(tok)
-            self.points.update_vector(tok, q_vec, alpha, self.step)
-            self.points.anchors[tok].importance += self.spec.dialogue_strength
-        for src, dst in zip(answer_tokens[:-1], answer_tokens[1:]):
-            self.gravity.reinforce_pair(src, dst, self.spec.gravity_reinforce_amount * self.spec.dialogue_strength)
+            self.points.update_vector(tok, F_a, alpha, self.step)
+            self._add_importance(tok, self.spec.dialogue_strength)
+
+        # 질문 토큰들도 F_q 방향으로 당김
+        # (질문이 자기 느낌을 더 선명하게 가지도록)
+        for tok in question_tokens:
+            self._ensure_anchor_exists(tok)
+            self.points.update_vector(tok, F_q, alpha * 0.5, self.step)
+
+        # 느낌 흐름 gravity: F_q 공간 근처 토큰 → F_a 공간 근처 토큰
+        # "이 느낌 다음엔 저 느낌이 온다"를 gravity에 기록
+        # F_q와 가장 가까운 질문 핵심 토큰 → F_a와 가장 가까운 답변 핵심 토큰
+        q_core_tok = self._closest_token_in_candidates(F_q, question_tokens)
+        a_core_tok = self._closest_token_in_candidates(F_a, answer_tokens)
+        if q_core_tok is not None and a_core_tok is not None:
+            self.gravity.reinforce_pair(
+                q_core_tok, a_core_tok,
+                self.spec.gravity_reinforce_amount * self.spec.dialogue_strength * 2.0,
+            )
+
         self._mark_cache_dirty()
 
     def _apply_qa_hint(self, vec: torch.Tensor) -> torch.Tensor:
@@ -417,6 +535,8 @@ class CWMCore:
         - '▁'  단독 word-start 마커 (decode시 공백/빈 문자열로 렌더링됨)
         - '__loop_' 포함 토큰 (CWM 내부 루프 앵커)
         - '<unk>' 등 특수 토큰
+        구두점(! ? . ,)은 문장 끝 패턴 학습을 위해 허용.
+        과출력 방지는 importance cap과 gravity 가중치로 제어.
         """
         if tok in ("▁", "<unk>", "", " "):
             return False
@@ -424,7 +544,53 @@ class CWMCore:
             return False
         if tok.startswith("<") and tok.endswith(">"):
             return False
+        punct = set("!?.,;:-~/@#$%^&*()[]{}|'\"+=<>")
+        if len(tok) == 1 and (tok in punct or tok.isascii() and tok.isalnum()):
+            return False
+        if tok.startswith("▁") and len(tok) == 2:
+            tail = tok[1]
+            if tail in punct or tail.isascii() and tail.isalnum():
+                return False
         return True
+
+    def _importance_cap(self, token: str) -> float:
+        """
+        토큰 타입별 importance 상한을 반환.
+        구두점과 짧은 subword 조각이 importance를 독점하는 것을 방지.
+        학습은 정상적으로 이루어지되 상한만 제한.
+        """
+        _PUNCT_SET = set("!?.,;:-~/@#$%^&*()[]{}|'\"+=<>")
+        # 단일 구두점
+        if len(token) == 1 and token in _PUNCT_SET:
+            return self.spec.punct_importance_cap
+        # ▁ 없이 시작하는 짧은 subword 조각 (길이 1~2)
+        if not token.startswith("▁") and len(token) <= 2 and not token.startswith("_"):
+            return self.spec.subword_importance_cap
+        # 그 외 일반 토큰은 무제한
+        return float("inf")
+
+    def _add_importance(self, token: str, amount: float) -> None:
+        anchor = self.points.anchors.get(token)
+        if anchor is None or amount == 0.0:
+            return
+        anchor.importance = min(self._importance_cap(token), anchor.importance + amount)
+
+    def _closest_token_in_candidates(self, vec: torch.Tensor, candidates: List[str]) -> Optional[str]:
+        best_token: Optional[str] = None
+        best_sim = -float("inf")
+        seen = set()
+        for tok in candidates:
+            if tok in seen:
+                continue
+            seen.add(tok)
+            anchor = self.points.anchors.get(tok)
+            if anchor is None:
+                continue
+            sim = self.cosine_sim(anchor.vec.to(self.device), vec.to(self.device))
+            if sim > best_sim:
+                best_sim = sim
+                best_token = tok
+        return best_token
 
     def _filter_output_tokens(self, tokens: List[str], scores: torch.Tensor) -> Tuple[List[str], torch.Tensor]:
         keep = [i for i, tok in enumerate(tokens) if self.is_emittable_token(tok)]
@@ -657,6 +823,77 @@ class CWMCore:
         active_idx = top_idx[keep_mask]
         return active_idx, strengths, sims
 
+    def _compute_activation_batch(
+        self,
+        input_tokens: List[str],
+    ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]:
+        """
+        여러 input_token의 activation을 mm() 한 번으로 계산.
+
+        반환:
+          active_idx_list : List[Tensor]  — 각 토큰의 활성 앵커 인덱스
+          strengths_mat   : [N_anchors × B] — 전체 strength 행렬
+          sims_mat        : [N_anchors × B] — 전체 유사도 행렬
+        B = len(input_tokens)
+        """
+        self._ensure_cache()
+        B = len(input_tokens)
+        empty = (
+            [torch.empty(0, dtype=torch.long, device=self.device)] * B,
+            torch.empty(0, device=self.device),
+            torch.empty(0, device=self.device),
+        )
+        if self._cache_matrix is None or B == 0:
+            return empty
+
+        # [256 × B] — 각 input token의 vec을 열로 쌓음
+        vecs = []
+        for tok in input_tokens:
+            anchor = self.points.anchors.get(tok)
+            if anchor is None:
+                # zeros 대신 random unit vector — zeros이면 모든 앵커와 유사도 0으로
+                # strength가 exp(-1/2σ²)로 균일하게 나와 top-k 선별이 무의미해짐.
+                # _ensure_anchor_exists가 앞에서 호출되므로 실제론 도달 안 하지만
+                # 방어 코드 차원에서 random unit vector로 채움.
+                vecs.append(self.points._random_unit_vector().to(self.device))
+            else:
+                vecs.append(anchor.vec.to(self.device))
+        input_stack = torch.stack(vecs, dim=1)  # [dim × B]
+
+        # [N_anchors × B] — mm() 한 번으로 전체 유사도 행렬
+        sims_mat = torch.mm(self._cache_matrix, input_stack)          # [N × B]
+        dists_mat = 1.0 - sims_mat
+        sigma = self.sigma()
+        strengths_mat = torch.exp(-(dists_mat ** 2) / (2.0 * sigma * sigma))  # [N × B]
+
+        k = min(self.spec.activation_top_k, strengths_mat.size(0))
+        if k <= 0:
+            return (
+                [torch.empty(0, dtype=torch.long, device=self.device)] * B,
+                strengths_mat,
+                sims_mat,
+            )
+
+        # 각 열(토큰)마다 top-k 선별
+        top_vals, top_idx = torch.topk(strengths_mat, k=k, dim=0)   # [k × B]
+        # threshold를 배치 전체가 아니라 토큰별 독립 분포 기준으로 계산.
+        # 배치 전체로 잡으면 "모든 문장에 자주 나오는 조각 토큰"이
+        # 여러 열에서 동시에 살아남아 importance/gravity를 독점하는 문제가 생김.
+
+        active_idx_list: List[torch.Tensor] = []
+        for b in range(B):
+            col_vals = top_vals[:, b]
+            col_idx  = top_idx[:, b]
+            # threshold를 이 토큰 열의 분포만으로 계산
+            col_threshold = self.stop_threshold(sigma, col_vals)
+            relative_threshold = float(col_vals[0].item()) * float(self.spec.activation_keep_ratio)
+            keep_mask = col_vals >= max(col_threshold, relative_threshold)
+            if int(keep_mask.sum().item()) < self.spec.activation_min_keep:
+                keep_mask[: min(self.spec.activation_min_keep, col_vals.numel())] = True
+            active_idx_list.append(col_idx[keep_mask])
+
+        return active_idx_list, strengths_mat, sims_mat
+
     def _update_nearest_distance(self, input_token: str, sims: torch.Tensor) -> None:
         if sims.numel() == 0 or input_token not in self._cache_index:
             self.stats.last_near_dist = 1.0
@@ -665,8 +902,10 @@ class CWMCore:
         sims2[self._cache_index[input_token]] = -1.0
         self.stats.last_near_dist = float(1.0 - sims2.max().item())
 
-    def _update_importance(self, active_idx: torch.Tensor, strengths: torch.Tensor) -> None:
-        self.points.decay_importance()
+    def _update_importance(self, active_idx: torch.Tensor, strengths: torch.Tensor, fast: bool = False) -> None:
+        # fast=True (배치 모드): decay/dim_importance/cache dirty는 배치 단위로 외부에서 처리.
+        if not fast:
+            self.points.decay_importance()
         if active_idx.numel() == 0:
             return
         ranked = sorted(
@@ -679,10 +918,15 @@ class CWMCore:
             token = self._cache_tokens[idx]
             strength = float(strengths[idx].item())
             anchor = self.points.anchors[token]
-            anchor.importance += strength
+            anchor.importance = min(
+                self._importance_cap(token),
+                anchor.importance + strength,
+            )
             anchor.last_active_step = self.step
-            self.dim_importance += torch.abs(anchor.vec) * strength
-        self._mark_cache_dirty()
+            if not fast:
+                self.dim_importance += torch.abs(anchor.vec) * strength
+        if not fast:
+            self._mark_cache_dirty()
 
     def _update_error_stats(self, error: float) -> None:
         self.stats.error_history.append(error)
@@ -815,7 +1059,7 @@ class CWMCore:
             if q_vec is not None:
                 for tok in target_tokens:
                     self.points.update_vector(tok, q_vec, self.alpha() * ratio * self.spec.imitation_update_scale, self.step)
-                    self.points.anchors[tok].importance += ratio * self.spec.imitation_importance_scale
+                    self._add_importance(tok, ratio * self.spec.imitation_importance_scale)
             self.gravity.reinforce_sequence(input_tokens + target_tokens, self.spec.gravity_reinforce_amount * ratio)
             self.orbits.observe(input_tokens + target_tokens, self.step, max(0.0, alignment))
             self._mark_cache_dirty()
@@ -894,6 +1138,7 @@ class CWMCore:
             return
 
         remaining: List[Dict[str, Any]] = []
+        cache_changed = False
         distance_scale = max(0.08, 1.0 - self.spec.similarity_merge)
         for wave in self.shock_waves:
             amplitude = float(wave.get("amplitude", 0.0))
@@ -929,6 +1174,7 @@ class CWMCore:
                             repel_dir = repel_dir / repel_norm
                             push = amplitude * float(ring_strength) * self.spec.shock_repel_strength
                             anchor.vec = l2_normalize(anchor.vec + repel_dir * push)
+                            cache_changed = True
 
             amplitude *= float(wave.get("decay", self.spec.shock_decay))
             if amplitude > 1e-3 and radius < self.spec.shock_max_radius:
@@ -937,7 +1183,7 @@ class CWMCore:
                 updated["amplitude"] = amplitude
                 remaining.append(updated)
 
-        if any(w not in remaining for w in self.shock_waves):
+        if cache_changed:
             self._mark_cache_dirty()
         self.shock_waves = remaining
 
@@ -969,6 +1215,110 @@ class CWMCore:
         if norm < 1e-6:
             return None
         return repel_vec / norm
+
+    def _apply_learning_step_precomputed(
+        self,
+        input_token: str,
+        next_token: str,
+        active_idx: torch.Tensor,
+        strengths: torch.Tensor,
+        sims: torch.Tensor,
+        update_context: bool,
+        recent_override: Optional[List[str]] = None,
+        fast: bool = False,
+    ) -> None:
+        """
+        _apply_learning_step과 동일하지만 activation(active_idx/strengths/sims)을
+        외부에서 미리 계산해서 받음 — step_update_batch의 mm() 배치화에 사용.
+        _compute_activation() 호출을 건너뛰므로 배치당 mv() 중복 제거.
+
+        fast=True: scores_from_context 호출 생략 (prediction loss 측정 스킵).
+        배치 학습에서 이 호출이 전체 시간의 ~99%를 차지하므로 fast 모드에서 제거.
+        prediction_loss_ema는 fast=False인 step_update (단일 스텝)에서 계속 측정됨.
+        """
+        self._ensure_cache()
+        if self._cache_matrix is None:
+            return
+
+        self._update_nearest_distance(input_token, sims)
+        self._update_importance(active_idx, strengths, fast=fast)
+
+        input_anchor = self.points.anchors[input_token]
+        target_anchor = self.points.anchors[next_token]
+        self._update_context_error(target_anchor.vec)
+
+        # fast=True여도 pred_eval_interval 스텝마다 1번 pred 측정.
+        # pred_ema가 고정되면 shock_wave pred_signal=0 → gravity 정리 안 됨.
+        _do_pred_eval = (not fast) or (self.step % self.spec.pred_eval_interval == 0)
+        if _do_pred_eval:
+            prediction = self.scores_from_context(fallback_token=input_token)
+            if prediction is not None:
+                pred_tokens, logits = prediction
+                if next_token in pred_tokens:
+                    loss = self.predictor.prediction_loss(logits, pred_tokens.index(next_token))
+                    self._update_prediction_metric(float(loss.item()))
+                    self.stats.last_alignment_score = self.imitation.alignment_score(
+                        [pred_tokens[int(torch.argmax(logits).item())]], [next_token]
+                    )
+                else:
+                    # next_token이 emittable 필터에 걸려도 pred_ema는 살려둠
+                    approx_loss = float(logits.max().item()) - float(logits.mean().item())
+                    if approx_loss > 0.0:
+                        self._update_prediction_metric(approx_loss)
+        structure_loss = self._estimate_structure_loss(input_token, next_token, active_idx, sims)
+        self._update_structure_metric(structure_loss)
+
+        error = self.dist_euclid(target_anchor.vec, input_anchor.vec)
+        self._update_error_stats(error)
+
+        alpha = self.alpha() * self.spec.pair_learning_scale
+        exclude = {input_token, next_token}
+        for idx in active_idx.tolist():
+            strength = float(strengths[idx].item())
+            if strength < self.spec.min_activation_for_update:
+                continue
+            token = self._cache_tokens[idx]
+            anchor = self.points.anchors[token]
+            gravity_bonus = self.gravity.get_forward_gravity(input_token, token)
+            attract_weight = alpha * (strength ** self.spec.activation_exponent) * (1.0 + gravity_bonus)
+
+            if self.spec.repulsion_strength > 0.0:
+                repel_vec = self._compute_repulsion(token, exclude_tokens=exclude)
+                if repel_vec is not None:
+                    repel_weight = alpha * strength * self.spec.repulsion_strength
+                    delta = attract_weight * (target_anchor.vec - anchor.vec) + repel_weight * repel_vec
+                    anchor.vec = l2_normalize(anchor.vec + delta)
+                    continue
+            self.points.update_vector(token, target_anchor.vec, attract_weight, self.step)
+
+        self._add_importance(input_token, self.spec.importance_attract * self.spec.pair_learning_scale)
+        self._add_importance(next_token, self.spec.importance_next * self.spec.pair_learning_scale)
+        self.gravity.reinforce_pair(input_token, next_token,
+            self.spec.gravity_reinforce_amount * self.spec.pair_gravity_scale)
+        if recent_override is None:
+            recent = self.context.recent_tokens(self.spec.orbit_max_length - 1)
+        else:
+            recent = recent_override[-(self.spec.orbit_max_length - 1) :]
+        if recent and recent[-1] == input_token:
+            path = recent + [next_token]
+        else:
+            path = recent + [input_token, next_token]
+        self.gravity.reinforce_sequence(path,
+            self.spec.gravity_reinforce_amount * self.spec.pair_gravity_scale)
+        self.orbits.observe(path, self.step, 1.0 - min(1.0, error))
+        self._maybe_create_loop(next_token, target_anchor.vec, sims)
+        # fast=True 배치 모드: cache dirty / shock wave는 배치 종료 후 한 번만 처리.
+        if not fast:
+            self._mark_cache_dirty()
+
+        if update_context:
+            self.context.advance_token(input_token, self.step)
+        # fast=True 배치 모드: context path가 안 쌓이므로 repeat 계산 의미없음.
+        # shock wave는 배치 종료 후 step_update_batch에서 한 번만 emit+propagate.
+        if not fast:
+            self._repeat_pattern_similar()
+            self._maybe_emit_shock_wave(input_token, preserve_tokens=path)
+            self._propagate_shock_waves()
 
     def _apply_learning_step(
         self,
@@ -1014,7 +1364,7 @@ class CWMCore:
             token = self._cache_tokens[idx]
             anchor = self.points.anchors[token]
             gravity_bonus = self.gravity.get_forward_gravity(input_token, token)
-            attract_weight = alpha * strength * (1.0 + gravity_bonus)
+            attract_weight = alpha * (strength ** self.spec.activation_exponent) * (1.0 + gravity_bonus)
 
             if self.spec.repulsion_strength > 0.0:
                 repel_vec = self._compute_repulsion(token, exclude_tokens=exclude)
@@ -1025,8 +1375,8 @@ class CWMCore:
                     continue
             self.points.update_vector(token, target_anchor.vec, attract_weight, self.step)
 
-        self.points.anchors[input_token].importance += self.spec.importance_attract
-        self.points.anchors[next_token].importance += self.spec.importance_next
+        self._add_importance(input_token, self.spec.importance_attract)
+        self._add_importance(next_token, self.spec.importance_next)
         self.gravity.reinforce_pair(input_token, next_token)
         if recent_override is None:
             recent = self.context.recent_tokens(self.spec.orbit_max_length - 1)
@@ -1056,19 +1406,66 @@ class CWMCore:
         self._apply_learning_step(input_token, next_token, update_context=True)
 
     def step_update_batch(self, pairs: List[Tuple[str, str]], fast: bool = True) -> None:
-        recent_tokens: List[str] = []
+        if not pairs:
+            return
+
+        # 앵커 확보 (mm 계산 전에 모두 존재해야 함)
         for input_token, next_token in pairs:
+            self._ensure_anchor_exists(input_token)
+            self._ensure_anchor_exists(next_token)
+        self._ensure_cache()
+
+        # fast 배치 모드: decay를 배치당 1회만 수행.
+        # 각 페어마다 호출하면 전체 앵커(8000+)를 32번 순회하는 낭비 발생.
+        if fast:
+            self.points.decay_importance()
+            self.gravity.decay_all()  # gravity도 배치당 1회 감쇠
+
+        # -------------------------------------------------------
+        # 핵심 최적화: 유사도 행렬을 mm() 한 번에 계산
+        # sims_mat     [N_anchors × B]
+        # strengths_mat[N_anchors × B]
+        # active_idx_list: List[Tensor] — 토큰별 활성 앵커 인덱스
+        # -------------------------------------------------------
+        input_tokens = [p[0] for p in pairs]
+        active_idx_list, strengths_mat, sims_mat = self._compute_activation_batch(input_tokens)
+
+        # vec 이동 / gravity / orbit은 순차 처리 (순서 의존성 유지)
+        recent_tokens: List[str] = []
+        for b, (input_token, next_token) in enumerate(pairs):
             self.step += 1
             if not recent_tokens or recent_tokens[-1] != input_token:
                 recent_tokens = [input_token]
             local_recent = recent_tokens[-(self.spec.orbit_max_length - 1) :]
-            self._apply_learning_step(
+
+            # 미리 계산된 activation 결과 사용
+            active_idx = active_idx_list[b]
+            sims = sims_mat[:, b] if sims_mat.numel() > 0 else torch.empty(0, device=self.device)
+            strengths = strengths_mat[:, b] if strengths_mat.numel() > 0 else torch.empty(0, device=self.device)
+
+            self._apply_learning_step_precomputed(
                 input_token,
                 next_token,
+                active_idx=active_idx,
+                strengths=strengths,
+                sims=sims,
                 update_context=not fast,
                 recent_override=local_recent,
+                fast=fast,
             )
             recent_tokens.append(next_token)
+
+        # 배치 전체 처리 후 cache 한 번만 재빌드 + shock wave emit + 정리
+        if fast:
+            self._mark_cache_dirty()
+            # fast 모드에서는 _apply_learning_step_precomputed 내부에서
+            # _maybe_emit_shock_wave가 스킵되므로 배치 끝에 한 번 호출.
+            # 배치의 마지막 input 토큰 기준으로 발동 여부 판단.
+            if pairs:
+                last_input = pairs[-1][0]
+                last_path = recent_tokens[-(self.spec.orbit_max_length):]
+                self._maybe_emit_shock_wave(last_input, preserve_tokens=last_path)
+            self._propagate_shock_waves()
 
     def maybe_manage_dimensions(self) -> None:
         return
@@ -1195,6 +1592,16 @@ class CWMCore:
         core.orbits.path_counts = {tuple(path): int(count) for path, count in data.get("orbit_counts", {}).items()}
         core.orbits.path_strength = {tuple(path): float(score) for path, score in data.get("orbit_strength", {}).items()}
         core.orbits.path_last_seen_step = {tuple(path): int(step) for path, step in data.get("orbit_last_seen", {}).items()}
+        # _prefix_index 재구축 (저장 파일에 없으므로 path_counts에서 복원)
+        core.orbits._prefix_index = {}
+        for full_path in list(core.orbits.path_counts.keys()):
+            if len(full_path) < 2:
+                continue
+            prefix: Tuple[str, ...] = tuple(full_path[:-1])
+            next_tok: str = str(full_path[-1])
+            if prefix not in core.orbits._prefix_index:
+                core.orbits._prefix_index[prefix] = {}
+            core.orbits._prefix_index[prefix][next_tok] = full_path
         core.context.state.path = [tuple(item) for item in data.get("context_path", [])]
         core.context.state.signatures = [(tuple(sig), int(step)) for sig, step in data.get("context_signatures", [])]
         core.raw_line_memory = [

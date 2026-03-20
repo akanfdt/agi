@@ -1,0 +1,72 @@
+"""
+CWM 생성 진단 스크립트
+python cwm_debug.py
+"""
+import torch
+from cwm_core import CWMCore
+from bpe_tokenizer import BPETokenizer
+
+MODEL_PATH = "cwm_model.pt"
+VOCAB_PATH = "cwm_tokens.json"
+
+print("loading...")
+core = CWMCore.load(MODEL_PATH)
+bpe = BPETokenizer.load(VOCAB_PATH)
+print(f"step={core.step} anchors={len(core.anchors)}")
+
+# ── 1. context 상태 ──────────────────────────────────────────
+print("\n[1] context state")
+print(f"  path length : {len(core.context.state.path)}")
+print(f"  recent(10)  : {core.context.recent_tokens(10)}")
+
+# ── 2. scores_from_context 직접 확인 (context 비어있는 상태) ──
+print("\n[2] scores_from_context (cold / no context)")
+result = core.scores_from_context(fallback_token=None)
+if result is None:
+    print("  → None 반환!")
+else:
+    toks, scores = result
+    top = torch.topk(scores, k=10)
+    print(f"  top10: {[(toks[int(i)], round(float(s),3)) for i, s in zip(top.indices, top.values)]}")
+
+# ── 3. 토큰 입력 후 예측 ──────────────────────────────────────
+test_inputs = ["안녕", "나는", "오늘"]
+for text in test_inputs:
+    tokens = bpe.encode(text)
+    print(f"\n[3] input='{text}' → tokens={tokens}")
+    if not tokens:
+        print("  토큰화 실패")
+        continue
+
+    # context에 등록
+    core.advance_context(tokens)
+
+    # context 기반 예측
+    result = core.scores_from_context(fallback_token=tokens[-1])
+    if result is None:
+        print("  scores_from_context → None")
+    else:
+        toks, scores = result
+        top = torch.topk(scores, k=10)
+        decoded = [(bpe.decode([toks[int(i)]]), round(float(s), 3)) for i, s in zip(top.indices, top.values)]
+        print(f"  top10 decoded: {decoded}")
+
+# ── 4. predict_next (벡터 기반, context 없이) ─────────────────
+print("\n[4] predict_next (vector-based, no context)")
+for text in ["안녕", "나는", "뭐야"]:
+    tokens = bpe.encode(text)
+    if not tokens:
+        continue
+    tok = tokens[0]
+    if tok not in core.anchors:
+        print(f"  '{tok}' 앵커 없음")
+        continue
+    result = core.predict_next(tok, top_k=5)
+    decoded = [(bpe.decode([t]), round(s, 3)) for t, s in result]
+    print(f"  '{text}'({tok}) → {decoded}")
+
+# ── 5. 핵심 지표 ─────────────────────────────────────────────
+print("\n[5] key metrics")
+m = core.get_metrics()
+for k, v in m.items():
+    print(f"  {k:30s} = {v:.4f}")
