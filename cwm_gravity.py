@@ -35,18 +35,6 @@ class GravityField:
 
     def reinforce_pair(self, src: str, dst: str, amount: float | None = None) -> None:
         delta = self.spec.gravity_reinforce_amount if amount is None else amount
-        # 짧은 조각 토큰끼리의 gravity 과강화 방지.
-        # 두 토큰 모두 짧을수록 delta를 약하게 줌.
-        # 최소 gravity_short_token_min_weight까지만 줄어듦.
-        src_clean = src.lstrip("▁")
-        dst_clean = dst.lstrip("▁")
-        src_weight = min(1.0, max(0.4, len(src_clean) / 4.0))
-        dst_weight = min(1.0, max(0.4, len(dst_clean) / 4.0))
-        length_weight = max(
-            self.spec.gravity_short_token_min_weight,
-            src_weight * dst_weight,
-        )
-        delta = delta * length_weight
         _nested_add(self.base_gravity, src, dst, delta)
         _nested_add(self.base_gravity, dst, src, delta * self.spec.gravity_reverse_ratio)
         _nested_add(self.forward_gravity, src, dst, delta)
@@ -65,8 +53,9 @@ class GravityField:
         for cand in candidate_tokens:
             total = 0.0
             for tok in active:
-                total += self.get_gravity(tok, cand)
-                total += self.get_forward_gravity(tok, cand) * self.spec.gravity_forward_prior_scale
+                out_degree = max(1, len(self.base_gravity.get(tok, {})))
+                norm = math.log1p(out_degree)
+                total += (self.get_gravity(tok, cand) + self.get_forward_gravity(tok, cand) * self.spec.gravity_forward_prior_scale) / norm
             scores.append(math.tanh(total / active_count))
         if not scores:
             return torch.empty(0)

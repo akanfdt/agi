@@ -15,7 +15,7 @@ from bpe_tokenizer import BPETokenizer
 from cwm_core import CWMCore
 
 
-MODEL_PATH = "tmp_birth_only_expansion_check.pt"
+MODEL_PATH = "cwm_model.pt"
 VOCAB_PATH = "cwm_tokens.json"
 
 

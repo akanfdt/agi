@@ -62,14 +62,6 @@ class CWMSpec:
 
     vram_target_gb: float = 8.0
 
-    emotion_intensity: float = 0.0
-    emotion_bias_step: float = 0.0
-
-    context_weight: float = 0.65
-    relation_weight: float = 0.35
-
-    output_importance_weight: float = 0.0
-
     qa_key_len: int = 6
     qa_weight: float = 0.25
     qa_memory_decay: float = 0.9
@@ -84,8 +76,6 @@ class CWMSpec:
     similarity_sample_ratio: float = 0.1
     similarity_sample_max: int = 200
     similarity_sample_min: int = 200
-    activation_top_k: int = 32
-    activation_keep_ratio: float = 0.5
     activation_min_keep: int = 3
     activation_exponent: float = 2.0
     importance_top_k: int = 8
@@ -102,10 +92,6 @@ class CWMSpec:
     imitation_cooldown_steps: int = 50_000
 
     dialogue_strength: float = 0.2
-
-    auto_calibrate: bool = False
-    auto_calibrate_steps: int = 2000
-    auto_calibrate_sample_max: int = 5000
 
     create_loop_threshold_scale: float = 1.5
     min_activation_for_update: float = 1e-4
@@ -125,16 +111,11 @@ class CWMSpec:
     line_summary_decay: float = 0.82
     line_summary_strength: float = 0.12
     line_summary_score_weight: float = 0.6
-    use_adaptive_priors: bool = False
-    adaptive_prior_beta: float = 0.98
 
     # -------------------------------------------------------
     # 반발력 (군집 분리)
     # -------------------------------------------------------
-    # 활성화된 앵커들 사이의 반발: 코사인 유사도가 이 값 이상이면 밀어냄
     repulsion_threshold: float = 0.85
-    # 반발력 세기. 0이면 반발 없음 (기존 동작 유지)
-    repulsion_strength: float = 0.00
 
     # -------------------------------------------------------
     # Shock wave (초신성 파동)
@@ -155,8 +136,7 @@ class CWMSpec:
     shock_ring_cutoff: float = 0.12
     # gravity decay 강도 스케일
     shock_gravity_scale: float = 1.6
-    # instability 계산의 repeat_signal 기저
-    shock_instability_base: float = 0.25
+    # (shock_instability_base 제거 — 공간 기반 트리거로 변경됨)
     # 파동 소멸 반경 상한
     shock_max_radius: float = 2.0
 
@@ -226,15 +206,6 @@ class CWMSpec:
     # 0.6으로 올려서 decay와 균형을 맞춤.
     pair_gravity_scale: float = 0.6
 
-    # -------------------------------------------------------
-    # importance 상한 (조각/구두점 독점 방지)
-    # -------------------------------------------------------
-    # subword 조각(▁ 없이 시작, 길이 짧은 토큰)의 importance 상한
-    subword_importance_cap: float = 8.0
-    # 단일 구두점/특수문자의 importance 상한
-    punct_importance_cap: float = 4.0
-    # gravity reinforce 시 짧은 토큰 쌍에 적용할 최소 가중치
-    gravity_short_token_min_weight: float = 0.3
 
     # -------------------------------------------------------
     # 생성 (sampling) 파라미터
@@ -267,12 +238,6 @@ class StatsState:
     score_count: int = 0
     score_mean: float = 0.0
     score_m2: float = 0.0
-    semantic_scale_ema: float = 0.0
-    gravity_prior_ema: float = 0.0
-    transition_prior_ema: float = 0.0
-    orbit_prior_ema: float = 0.0
-    imitation_prior_ema: float = 0.0
-    summary_prior_ema: float = 0.0
     last_prediction_loss: float = 0.0
     prediction_loss_ema: float = 0.0
     imitation_loss_ema: float = 0.0

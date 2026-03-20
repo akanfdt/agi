@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 
 from cwm_core import CWMCore
 
@@ -82,8 +83,12 @@ def build_plot(
     vectors = np.stack([core.anchors[tok].vec.detach().cpu().numpy() for tok in display_tokens], axis=0)
     importance = np.array([float(core.anchors[tok].importance) for tok in display_tokens], dtype=np.float32)
 
-    pca = PCA(n_components=2, random_state=random_seed)
-    coords = pca.fit_transform(vectors)
+    # PCA로 먼저 50차원으로 줄인 뒤 t-SNE로 2D 투영 (속도+품질 균형)
+    n_pre = min(50, vectors.shape[0] - 1, vectors.shape[1])
+    pca_pre = PCA(n_components=n_pre, random_state=random_seed)
+    vectors_reduced = pca_pre.fit_transform(vectors)
+    tsne = TSNE(n_components=2, perplexity=min(30, len(display_tokens) // 4), random_state=random_seed, max_iter=1000)
+    coords = tsne.fit_transform(vectors_reduced)
 
     n_clusters = max(2, min(12, len(display_tokens) // 20))
     if len(display_tokens) < n_clusters:
@@ -142,8 +147,8 @@ def build_plot(
         f"CWM Point Universe | anchors={len(display_tokens)} shown / {len(core.anchors)} total | step={core.step}",
         fontsize=14,
     )
-    ax.set_xlabel("PCA-1")
-    ax.set_ylabel("PCA-2")
+    ax.set_xlabel("t-SNE-1")
+    ax.set_ylabel("t-SNE-2")
     ax.grid(alpha=0.12)
 
     importance_note = "\n".join(

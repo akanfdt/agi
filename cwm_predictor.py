@@ -17,7 +17,6 @@ class Predictor:
         self,
         query: torch.Tensor,
         candidate_matrix: torch.Tensor,
-        importance_vec: torch.Tensor,
         gravity_prior: torch.Tensor | None = None,
         summary_prior: torch.Tensor | None = None,
         orbit_prior: torch.Tensor | None = None,
@@ -27,8 +26,6 @@ class Predictor:
         query = query.to(self.device)
         matrix = candidate_matrix.to(self.device)
         scores = torch.mv(matrix, query)
-        if importance_vec.numel() == scores.numel():
-            scores = scores + self.spec.output_importance_weight * torch.sigmoid(importance_vec.to(self.device))
         if gravity_prior is not None and gravity_prior.numel() == scores.numel():
             scores = scores + gravity_prior.to(self.device)
         if summary_prior is not None and summary_prior.numel() == scores.numel():
